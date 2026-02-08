@@ -8,6 +8,12 @@ import random
 import sys
 import tempfile
 import subprocess
+import re
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("local-tts")
 
 # Set environment variables for cache
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,27 +36,67 @@ VOICES = ['alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', '
 def get_pocket():
     if MODELS["pocket"] is None:
         from pocket_tts import TTSModel
-        print("Loading Pocket TTS...", file=sys.stderr)
+        logger.info("Loading Pocket TTS...")
         MODELS["pocket"] = TTSModel.load_model()
     return MODELS["pocket"]
 
-import re
-
 def split_text(text: str, max_length: int = 200) -> list[str]:
-    """Split text into chunks ensuring no chunk exceeds max_length."""
+    """
+    Split text into chunks ensuring no chunk exceeds max_length.
+    Handles long sentences by splitting on commas or spaces, and forces split if words are too long.
+    """
+    if not text:
+        return []
+
+    # Normalize whitespace: replace newlines/tabs with spaces and collapse multiple spaces
+    text = " ".join(text.split())
+    
     chunks = []
     current_chunk = ""
     
     # Split by common sentence terminators while keeping them
+    # This regex looks for punctuation followed by space
     sentences = re.split(r'(?<=[.!?])\s+', text)
     
     for sentence in sentences:
-        if len(current_chunk) + len(sentence) < max_length:
+        if not sentence.strip():
+            continue
+            
+        # Check if adding this sentence exceeds max_length
+        if len(current_chunk) + len(sentence) + 1 <= max_length:
             current_chunk += sentence + " "
         else:
+            # If current chunk has content, push it
             if current_chunk:
                 chunks.append(current_chunk.strip())
-            current_chunk = sentence + " "
+                current_chunk = ""
+            
+            # If the sentence itself is too long, we need to break it down further
+            if len(sentence) > max_length:
+                words = sentence.split(' ')
+                temp_chunk = ""
+                for word in words:
+                    # Check if word itself is too long
+                    if len(word) > max_length:
+                        # Split very long word into pieces
+                        for i in range(0, len(word), max_length):
+                            sub_word = word[i:i+max_length]
+                            if len(temp_chunk) + len(sub_word) + 1 <= max_length:
+                                temp_chunk += sub_word + " "
+                            else:
+                                if temp_chunk:
+                                    chunks.append(temp_chunk.strip())
+                                temp_chunk = sub_word + " "
+                    else:
+                        if len(temp_chunk) + len(word) + 1 <= max_length:
+                            temp_chunk += word + " "
+                        else:
+                            if temp_chunk:
+                                chunks.append(temp_chunk.strip())
+                            temp_chunk = word + " "
+                current_chunk = temp_chunk # Start next chunk with remainder
+            else:
+                current_chunk = sentence + " "
             
     if current_chunk:
         chunks.append(current_chunk.strip())
@@ -63,13 +109,17 @@ def prepare_voice_file(voice_path: str) -> str:
     Returns path to use (either original or temp trimmed).
     """
     try:
+        if not os.path.exists(voice_path):
+             logger.error(f"Voice file not found: {voice_path}")
+             return voice_path
+
         # Check duration
         sr, data = wavfile.read(voice_path)
         duration = len(data) / sr
         
         # If longer than 10 seconds, trim it
         if duration > 10.0:
-            print(f"Voice file {os.path.basename(voice_path)} is {duration:.1f}s long. Trimming to 10s.", file=sys.stderr)
+            logger.info(f"Voice file {os.path.basename(voice_path)} is {duration:.1f}s long. Trimming to 10s.")
             # Create temp file
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
                 temp_wav_path = temp_wav.name
@@ -81,7 +131,7 @@ def prepare_voice_file(voice_path: str) -> str:
             return temp_wav_path
             
     except Exception as e:
-        print(f"Warning: Failed to process voice file {voice_path}: {e}", file=sys.stderr)
+        logger.warning(f"Failed to process voice file {voice_path}: {e}")
         
     return voice_path
 
@@ -96,8 +146,14 @@ def speak(text: str, voice_path: str = None) -> str:
     """
     start_time = time.time()
     
+    if not text or not text.strip():
+        return "Error: Text input is empty."
+
     # Always use pocket
-    model = get_pocket()
+    try:
+        model = get_pocket()
+    except Exception as e:
+        return f"Error loading TTS model: {e}"
     
     voice_file_to_use = None
     voice_name = None
@@ -115,14 +171,16 @@ def speak(text: str, voice_path: str = None) -> str:
             voice_file_to_use = env_path
             voice_name = os.path.basename(env_path) + " (default)"
         else:
-            return f"Error: Configured default voice file not found at {env_path}"
+            # Fallback if env var points to invalid file
+            voice_name = "random" 
 
+    voice_state = None
     if voice_file_to_use:
         try:
             # Prepare file (trim if needed)
             processed_voice_path = prepare_voice_file(voice_file_to_use)
             
-            print(f"Cloning voice from: {voice_name}", file=sys.stderr)
+            logger.info(f"Cloning voice from: {voice_name}")
             voice_state = model.get_state_for_audio_prompt(processed_voice_path)
             
             # Clean up temp file if we created one
@@ -130,67 +188,107 @@ def speak(text: str, voice_path: str = None) -> str:
                 os.remove(processed_voice_path)
                 
         except Exception as e:
+            logger.error(f"Error loading custom voice: {str(e)}")
             return f"Error loading custom voice: {str(e)}"
     else:
-        voice_name = random.choice(VOICES)
+        if not voice_name:
+            voice_name = random.choice(VOICES)
         try:
-            voice_state = model.get_state_for_audio_prompt(voice_name)
-        except Exception:
+            # If voice_name is not in VOICES (e.g. from failed env var), fallback to alba
+            if voice_name not in VOICES and "default" not in voice_name:
+                 voice_name = "alba"
+            
+            clean_name = voice_name.split(" (")[0]
+            if clean_name in VOICES:
+                 voice_state = model.get_state_for_audio_prompt(clean_name)
+            else:
+                 voice_state = model.get_state_for_audio_prompt("alba")
+                 voice_name = "alba (fallback)"
+        except Exception as e:
+             logger.error(f"Error setting voice state: {e}")
              voice_state = model.get_state_for_audio_prompt("alba")
     
     # Process text in chunks to avoid tensor size mismatch errors with long text
     chunks = split_text(text)
     audio_segments = []
+    errors = []
     
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         if not chunk.strip():
             continue
         try:
             # Generate audio for each chunk
             segment = model.generate_audio(voice_state, chunk)
+            
+            # Validation: Ensure segment is a valid tensor
+            if not isinstance(segment, torch.Tensor):
+                 logger.warning(f"Chunk {i} generated non-tensor output: {type(segment)}")
+                 continue
+                 
+            if segment.dim() == 0 or segment.numel() == 0:
+                 logger.warning(f"Chunk {i} generated empty tensor.")
+                 continue
+                 
+            # Ensure 2D [1, T] or 1D [T] -> 2D [1, T]
+            if segment.dim() == 1:
+                segment = segment.unsqueeze(0)
+                
             audio_segments.append(segment)
         except Exception as e:
-            print(f"Error generating audio for chunk '{chunk[:20]}...': {e}", file=sys.stderr)
+            msg = f"Error generating audio for chunk '{chunk[:20]}...': {e}"
+            logger.error(msg)
+            errors.append(msg)
             continue
             
     if not audio_segments:
-        return "Error: No audio generated."
+        if errors:
+            return f"Error: Failed to generate audio. Details: {'; '.join(errors[:3])}"
+        return "Error: No audio generated (empty text or filtering)."
         
     # Concatenate all audio segments
-    if len(audio_segments) > 1:
-        audio = torch.cat(audio_segments, dim=1)
-    else:
-        audio = audio_segments[0]
-         
-    # Create a temporary file to save the audio
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-        temp_wav_path = temp_wav.name
-        wavfile.write(temp_wav_path, model.sample_rate, audio.numpy())
-    
     try:
+        if len(audio_segments) > 1:
+            audio = torch.cat(audio_segments, dim=1)
+        else:
+            audio = audio_segments[0]
+            
+        # Final shape check
+        if audio.dim() != 2 or audio.size(0) != 1:
+             logger.warning(f"Unexpected audio shape: {audio.shape}, attempting to fix.")
+             if audio.dim() == 1:
+                 audio = audio.unsqueeze(0)
+             # If it's something else, wavfile.write might fail or work depending on numpy conversion
+             
+        # Create a temporary file to save the audio
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+            temp_wav_path = temp_wav.name
+            wavfile.write(temp_wav_path, model.sample_rate, audio.squeeze().numpy())
+        
         # Play the audio using afplay (macOS)
         if sys.platform == "darwin":
             subprocess.run(["afplay", temp_wav_path], check=True)
         else:
-            # Fallback for Linux (aplay) - assuming 'aplay' exists, otherwise this might fail or we could try to detect
-            # For this specific project (macOS focused), afplay is sufficient.
             subprocess.run(["aplay", temp_wav_path], check=False)
             
     except Exception as e:
-        print(f"Error playing audio: {e}", file=sys.stderr)
+        logger.error(f"Error playing/saving audio: {e}")
+        return f"Error playing audio: {e}"
+        
     finally:
         # Clean up the temporary file
-        if os.path.exists(temp_wav_path):
+        if 'temp_wav_path' in locals() and os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
         
     duration = time.time() - start_time
-    return f"Spoken: '{text}' (voice: {voice_name}) in {duration:.2f}s"
-
-if __name__ == "__main__":
-    print("Starting Local TTS MCP Server...", file=sys.stderr)
-    mcp.run()
+    status_msg = f"Spoken: '{text[:50]}...' (voice: {voice_name}) in {duration:.2f}s"
+    if errors:
+        status_msg += f" (Note: {len(errors)} chunks failed to generate)"
+    return status_msg
 
 def main():
     """Entry point for the console script."""
     print("Starting Local TTS MCP Server...", file=sys.stderr)
     mcp.run()
+
+if __name__ == "__main__":
+    main()
