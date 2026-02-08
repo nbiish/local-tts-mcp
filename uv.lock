@@ -314,6 +314,7 @@ name = "local-tts-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub", marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "mcp", extra = ["cli"], marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11' and platform_machine == 'arm64' and sys_platform == 'darwin'" },
     { name = "numpy", version = "2.4.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11' and platform_machine == 'arm64' and sys_platform == 'darwin'" },
@@ -325,6 +326,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.23.0" },
     { name = "mcp", extras = ["cli"] },
     { name = "numpy" },
     { name = "pocket-tts" },

@@ -17,6 +17,7 @@ dependencies = [
     "scipy",
     "numpy",
     "torch>=2.4.0",
+    "huggingface-hub>=0.23.0",
 ]
 
 [[tool.uv.index]]

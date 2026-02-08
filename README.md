@@ -8,6 +8,7 @@ Add high-quality, local text-to-speech capabilities to your AI assistant. Powere
 - 🗣️ **Natural Voices**: Uses high-quality Pocket TTS voices.
 - 🔊 **Auto-Play**: Audio plays immediately on the server machine.
 - 🎲 **Simple Usage**: Automatically selects a random voice for variety.
+- 🦜 **Voice Cloning**: Clone any voice using a reference WAV file.
 - 🔒 **Private**: All audio generation happens locally.
 
 ## Installation
@@ -17,6 +18,17 @@ Add high-quality, local text-to-speech capabilities to your AI assistant. Powere
 - [uv](https://github.com/astral-sh/uv) (Recommended for fast setup)
 - Python 3.10+
 - macOS (Required for `afplay` support)
+- **Hugging Face Account** (Required for Voice Cloning only)
+
+### Voice Cloning Setup
+
+To use the voice cloning feature, you must:
+
+1.  Accept the terms of service for the [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts) model on Hugging Face.
+2.  Authenticate locally using the Hugging Face CLI:
+    ```bash
+    uvx hf auth login
+    ```
 
 ### Quick Start (Claude Desktop)
 
@@ -39,15 +51,19 @@ Add high-quality, local text-to-speech capabilities to your AI assistant. Powere
        "local-tts": {
          "command": "uv",
          "args": [
+           "run",
            "--directory",
            "/ABSOLUTE/PATH/TO/local-tts-mcp",
-           "run",
            "local-tts"
-         ]
+         ],
+         "env": {
+           "LOCAL_TTS_VOICE_PATH": "/path/to/your/custom-voice.wav"
+         }
        }
      }
    }
    ```
+   *Note: `LOCAL_TTS_VOICE_PATH` is optional. If omitted, the server uses random default voices.*
 
 3. **Restart Claude Desktop**.
 
@@ -59,8 +75,10 @@ Generates speech from text and plays it immediately on the host machine.
 
 - **Arguments**:
   - `text` (string): The text you want spoken.
+  - `voice_path` (string, optional): Path to a WAV file for voice cloning.
 - **Behavior**:
-  - Selects a random voice.
+  - Uses `LOCAL_TTS_VOICE_PATH` if configured and no `voice_path` is provided.
+  - Falls back to a random voice if no cloning source is available.
   - Plays audio locally.
   - Automatically cleans up temporary files.
 
