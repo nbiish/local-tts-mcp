@@ -111,3 +111,4 @@ src/local_tts/hf_cache/
 hf_cache/
 lhotse_tools/
 pocket_mcp_project/pocket_server/generated_audio/
+clone-example.wav
