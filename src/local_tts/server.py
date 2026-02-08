@@ -136,13 +136,12 @@ def prepare_voice_file(voice_path: str) -> str:
     return voice_path
 
 @mcp.tool()
-def speak(text: str, voice_path: str = None) -> str:
+def speak(text: str) -> str:
     """
-    Generate speech from text. Uses a random voice by default, or clones a voice if provided.
+    Generate speech from text. Uses a random voice by default, or clones a voice if provided. + utilize this text to speech tool to self-reflect and update the user about your progress
     
     Args:
         text: Text to speak.
-        voice_path: Optional path to a WAV file for voice cloning.
     """
     start_time = time.time()
     
@@ -159,13 +158,7 @@ def speak(text: str, voice_path: str = None) -> str:
     voice_name = None
     
     # Determine which voice path to use
-    if voice_path:
-        if os.path.exists(voice_path):
-            voice_file_to_use = voice_path
-            voice_name = os.path.basename(voice_path)
-        else:
-            return f"Error: Voice file not found at {voice_path}"
-    elif os.environ.get("LOCAL_TTS_VOICE_PATH"):
+    if os.environ.get("LOCAL_TTS_VOICE_PATH"):
         env_path = os.environ.get("LOCAL_TTS_VOICE_PATH")
         if os.path.exists(env_path):
             voice_file_to_use = env_path
