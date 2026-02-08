@@ -10,6 +10,7 @@ import tempfile
 import subprocess
 import re
 import logging
+import threading
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -135,37 +136,13 @@ def prepare_voice_file(voice_path: str) -> str:
         
     return voice_path
 
-@mcp.tool()
-def speak(text: str) -> str:
-    """
-    Generate speech from text. Uses a random voice by default, or clones a voice if provided. + utilize this text to speech tool to self-reflect and update the user about your progress
-    
-    Args:
-        text: Text to speak.
-    """
+def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name: str | None):
     start_time = time.time()
-    
-    if not text or not text.strip():
-        return "Error: Text input is empty."
-
-    # Always use pocket
     try:
         model = get_pocket()
     except Exception as e:
-        return f"Error loading TTS model: {e}"
-    
-    voice_file_to_use = None
-    voice_name = None
-    
-    # Determine which voice path to use
-    if os.environ.get("LOCAL_TTS_VOICE_PATH"):
-        env_path = os.environ.get("LOCAL_TTS_VOICE_PATH")
-        if os.path.exists(env_path):
-            voice_file_to_use = env_path
-            voice_name = os.path.basename(env_path) + " (default)"
-        else:
-            # Fallback if env var points to invalid file
-            voice_name = "random" 
+        logger.error(f"Error loading TTS model: {e}")
+        return
 
     voice_state = None
     if voice_file_to_use:
@@ -182,7 +159,7 @@ def speak(text: str) -> str:
                 
         except Exception as e:
             logger.error(f"Error loading custom voice: {str(e)}")
-            return f"Error loading custom voice: {str(e)}"
+            return
     else:
         if not voice_name:
             voice_name = random.choice(VOICES)
@@ -235,8 +212,10 @@ def speak(text: str) -> str:
             
     if not audio_segments:
         if errors:
-            return f"Error: Failed to generate audio. Details: {'; '.join(errors[:3])}"
-        return "Error: No audio generated (empty text or filtering)."
+            logger.error(f"Error: Failed to generate audio. Details: {'; '.join(errors[:3])}")
+        else:
+            logger.error("Error: No audio generated (empty text or filtering).")
+        return
         
     # Concatenate all audio segments
     try:
@@ -265,7 +244,6 @@ def speak(text: str) -> str:
             
     except Exception as e:
         logger.error(f"Error playing/saving audio: {e}")
-        return f"Error playing audio: {e}"
         
     finally:
         # Clean up the temporary file
@@ -276,7 +254,41 @@ def speak(text: str) -> str:
     status_msg = f"Spoken: '{text[:50]}...' (voice: {voice_name}) in {duration:.2f}s"
     if errors:
         status_msg += f" (Note: {len(errors)} chunks failed to generate)"
-    return status_msg
+    logger.info(status_msg)
+
+@mcp.tool()
+def speak(text: str) -> str:
+    """
+    Generate speech from text. Uses a random voice by default, or clones a voice if provided. + utilize this text to speech tool to self-reflect and update the user about your progress
+    
+    Args:
+        text: Text to speak.
+    """
+    if not text or not text.strip():
+        return "Error: Text input is empty."
+
+    voice_file_to_use = None
+    voice_name = None
+    
+    # Determine which voice path to use
+    if os.environ.get("LOCAL_TTS_VOICE_PATH"):
+        env_path = os.environ.get("LOCAL_TTS_VOICE_PATH")
+        if os.path.exists(env_path):
+            voice_file_to_use = env_path
+            voice_name = os.path.basename(env_path) + " (default)"
+        else:
+            # Fallback if env var points to invalid file
+            voice_name = "random" 
+
+    # Start audio generation in a background thread
+    thread = threading.Thread(
+        target=generate_and_play_audio, 
+        args=(text, voice_file_to_use, voice_name)
+    )
+    thread.daemon = True
+    thread.start()
+    
+    return "Audio generation started in background. Proceed."
 
 def main():
     """Entry point for the console script."""
