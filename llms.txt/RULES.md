@@ -12,6 +12,8 @@
 - **Privacy**: No external API calls for audio generation.
 - **Performance**: Optimize for local execution (Apple Silicon preferred).
 - **Dependency Management**: Use `uv` for all dependency handling.
+- **Authentication**: Rely on local authentication (e.g., `huggingface-hub`) rather than passing tokens in arguments.
+- **Configuration**: Use environment variables (e.g., `LOCAL_TTS_VOICE_PATH`) for persistent user preferences.
 
 ## Commit Messages
 

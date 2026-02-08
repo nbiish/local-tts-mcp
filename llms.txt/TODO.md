@@ -14,3 +14,6 @@
 - [x] Implement random voice selection
 - [x] Remove `list_engines` tool to minimize token usage
 - [x] Update documentation and installation guide (uv support)
+- [x] Implement Voice Cloning support (`voice_path` argument)
+- [x] Implement Default Voice Cloning via `LOCAL_TTS_VOICE_PATH`
+- [x] Add Authentication support for gated models (Hugging Face)
