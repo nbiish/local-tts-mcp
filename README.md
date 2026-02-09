@@ -26,6 +26,8 @@ Add high-quality, local text-to-speech capabilities to your AI assistant. Powere
 
 - 🚀 **Fast & Local**: Optimized for Apple Silicon. No cloud APIs, no internet required.
 - 🗣️ **Natural Voices**: Uses high-quality Pocket TTS voices.
+- ⚡ **Non-Blocking**: Returns control immediately while audio generates in the background.
+- 🔄 **Queued Playback**: Maintains correct speech order even when multiple requests are sent rapidly.
 - 🔊 **Auto-Play**: Audio plays immediately on the server machine.
 - 🎲 **Simple Usage**: Automatically selects a random voice for variety.
 - 🦜 **Voice Cloning**: Clone any voice using a reference WAV file.
@@ -91,12 +93,15 @@ To use the voice cloning feature, you must:
 
 ### `speak`
 
-Generates speech from text and plays it immediately on the host machine.
+Generates speech from text and plays it on the host machine.
 
 - **Arguments**:
   - `text` (string): The text you want spoken.
   - `voice_path` (string, optional): Path to a WAV file for voice cloning.
 - **Behavior**:
+  - Returns immediately with a confirmation message ("Audio generation started...").
+  - Generates audio in the background (non-blocking).
+  - Queues playback to ensure messages are spoken in the correct order.
   - Uses `LOCAL_TTS_VOICE_PATH` if configured and no `voice_path` is provided.
   - Falls back to a random voice if no cloning source is available.
   - Plays audio locally.

@@ -27,6 +27,33 @@ os.makedirs(os.environ["LHOTSE_TOOLS_DIR"], exist_ok=True)
 # Initialize FastMCP
 mcp = FastMCP("Local TTS")
 
+# Global locks
+PLAYBACK_LOCK = threading.Lock()
+
+class PlaybackCoordinator:
+    def __init__(self):
+        self.current_ticket = 0
+        self.next_ticket = 0
+        self.condition = threading.Condition()
+
+    def get_ticket(self):
+        with self.condition:
+            ticket = self.next_ticket
+            self.next_ticket += 1
+            return ticket
+
+    def wait_for_turn(self, ticket):
+        with self.condition:
+            while ticket != self.current_ticket:
+                self.condition.wait()
+
+    def finish_turn(self):
+        with self.condition:
+            self.current_ticket += 1
+            self.condition.notify_all()
+
+coordinator = PlaybackCoordinator()
+
 # Global model cache
 MODELS = {
     "pocket": None
@@ -136,12 +163,14 @@ def prepare_voice_file(voice_path: str) -> str:
         
     return voice_path
 
-def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name: str | None):
+def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name: str | None, ticket: int):
     start_time = time.time()
     try:
         model = get_pocket()
     except Exception as e:
         logger.error(f"Error loading TTS model: {e}")
+        # Even if we fail, we MUST increment the counter so next messages aren't stuck forever
+        coordinator.finish_turn()
         return
 
     voice_state = None
@@ -159,6 +188,7 @@ def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name
                 
         except Exception as e:
             logger.error(f"Error loading custom voice: {str(e)}")
+            coordinator.finish_turn()
             return
     else:
         if not voice_name:
@@ -215,6 +245,7 @@ def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name
             logger.error(f"Error: Failed to generate audio. Details: {'; '.join(errors[:3])}")
         else:
             logger.error("Error: No audio generated (empty text or filtering).")
+        coordinator.finish_turn()
         return
         
     # Concatenate all audio segments
@@ -236,9 +267,12 @@ def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name
             temp_wav_path = temp_wav.name
             wavfile.write(temp_wav_path, model.sample_rate, audio.squeeze().numpy())
         
+        # Wait for our turn to play
+        coordinator.wait_for_turn(ticket)
+        
         # Play the audio using afplay (macOS)
         if sys.platform == "darwin":
-            subprocess.run(["afplay", temp_wav_path], check=True)
+            subprocess.run(["afplay", "-r", "1.2", temp_wav_path], check=True)
         else:
             subprocess.run(["aplay", temp_wav_path], check=False)
             
@@ -246,6 +280,9 @@ def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name
         logger.error(f"Error playing/saving audio: {e}")
         
     finally:
+        # Always finish turn so next item can play
+        coordinator.finish_turn()
+        
         # Clean up the temporary file
         if 'temp_wav_path' in locals() and os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
@@ -259,7 +296,7 @@ def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name
 @mcp.tool()
 def speak(text: str) -> str:
     """
-    Generate speech from text. Uses a random voice by default, or clones a voice if provided. + utilize this text to speech tool to self-reflect and update the user about your progress
+    Generate speech from text. + utilize this tool to self-reflect and concisely update the user about your progress.
     
     Args:
         text: Text to speak.
@@ -280,10 +317,13 @@ def speak(text: str) -> str:
             # Fallback if env var points to invalid file
             voice_name = "random" 
 
+    # Get a ticket for playback order
+    ticket = coordinator.get_ticket()
+
     # Start audio generation in a background thread
     thread = threading.Thread(
         target=generate_and_play_audio, 
-        args=(text, voice_file_to_use, voice_name)
+        args=(text, voice_file_to_use, voice_name, ticket)
     )
     thread.daemon = True
     thread.start()
