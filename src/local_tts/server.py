@@ -11,6 +11,8 @@ import subprocess
 import re
 import logging
 import threading
+import queue
+import gc
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -59,14 +61,27 @@ MODELS = {
     "pocket": None
 }
 
+# Task Queue for model generation
+generation_queue = queue.Queue()
+
 VOICES = ['alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma']
 
 def get_pocket():
     if MODELS["pocket"] is None:
         from pocket_tts import TTSModel
-        logger.info("Loading Pocket TTS...")
+        logger.info("Loading Pocket TTS model into memory...")
         MODELS["pocket"] = TTSModel.load_model()
     return MODELS["pocket"]
+
+def unload_pocket():
+    if MODELS["pocket"] is not None:
+        logger.info("Model idle for 10s. Unloading Pocket TTS from memory...")
+        MODELS["pocket"] = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
 
 def split_text(text: str, max_length: int = 200) -> list[str]:
     """
@@ -163,13 +178,44 @@ def prepare_voice_file(voice_path: str) -> str:
         
     return voice_path
 
-def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name: str | None, ticket: int):
+def play_audio_task(temp_wav_path: str, ticket: int, start_time: float, text_preview: str, voice_name: str):
+    """
+    Handles the sequential playback of the generated audio.
+    """
+    try:
+        # Wait for our turn to play
+        coordinator.wait_for_turn(ticket)
+        
+        # Play the audio using afplay (macOS)
+        if sys.platform == "darwin":
+            subprocess.run(["afplay", "-r", "1.2", temp_wav_path], check=True)
+        else:
+            subprocess.run(["aplay", temp_wav_path], check=False)
+            
+        duration = time.time() - start_time
+        logger.info(f"Spoken: '{text_preview}...' (voice: {voice_name}) in {duration:.2f}s")
+
+    except Exception as e:
+        logger.error(f"Error playing audio: {e}")
+        
+    finally:
+        # Always finish turn so next item can play
+        coordinator.finish_turn()
+        
+        # Clean up the temporary file
+        if os.path.exists(temp_wav_path):
+            os.remove(temp_wav_path)
+
+def process_generation_task(text: str, voice_file_to_use: str | None, voice_name: str | None, ticket: int):
+    """
+    Executed by the model worker thread. 
+    Loads model (if needed), generates audio, and spawns playback thread.
+    """
     start_time = time.time()
     try:
         model = get_pocket()
     except Exception as e:
         logger.error(f"Error loading TTS model: {e}")
-        # Even if we fail, we MUST increment the counter so next messages aren't stuck forever
         coordinator.finish_turn()
         return
 
@@ -260,38 +306,59 @@ def generate_and_play_audio(text: str, voice_file_to_use: str | None, voice_name
              logger.warning(f"Unexpected audio shape: {audio.shape}, attempting to fix.")
              if audio.dim() == 1:
                  audio = audio.unsqueeze(0)
-             # If it's something else, wavfile.write might fail or work depending on numpy conversion
              
         # Create a temporary file to save the audio
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
             temp_wav_path = temp_wav.name
             wavfile.write(temp_wav_path, model.sample_rate, audio.squeeze().numpy())
         
-        # Wait for our turn to play
-        coordinator.wait_for_turn(ticket)
-        
-        # Play the audio using afplay (macOS)
-        if sys.platform == "darwin":
-            subprocess.run(["afplay", "-r", "1.2", temp_wav_path], check=True)
-        else:
-            subprocess.run(["aplay", temp_wav_path], check=False)
+        # Hand off to playback thread (so model worker is free to process next item)
+        playback_thread = threading.Thread(
+            target=play_audio_task,
+            args=(temp_wav_path, ticket, start_time, text[:50], voice_name)
+        )
+        playback_thread.daemon = True
+        playback_thread.start()
             
     except Exception as e:
-        logger.error(f"Error playing/saving audio: {e}")
-        
-    finally:
-        # Always finish turn so next item can play
+        logger.error(f"Error saving audio for playback: {e}")
         coordinator.finish_turn()
-        
-        # Clean up the temporary file
+        # Cleanup if needed
         if 'temp_wav_path' in locals() and os.path.exists(temp_wav_path):
             os.remove(temp_wav_path)
-        
-    duration = time.time() - start_time
-    status_msg = f"Spoken: '{text[:50]}...' (voice: {voice_name}) in {duration:.2f}s"
-    if errors:
-        status_msg += f" (Note: {len(errors)} chunks failed to generate)"
-    logger.info(status_msg)
+
+def model_worker_loop():
+    """
+    Background loop that processes generation requests.
+    Unloads model if no requests come in for 10 seconds.
+    """
+    logger.info("Model worker loop started.")
+    while True:
+        try:
+            # Wait for 10 seconds for a new task
+            task = generation_queue.get(timeout=10.0)
+        except queue.Empty:
+            # Timeout reached, unload model if it is loaded
+            unload_pocket()
+            continue
+
+        # We have a task
+        try:
+            text, voice_file, voice_name, ticket = task
+            process_generation_task(text, voice_file, voice_name, ticket)
+        except Exception as e:
+            logger.error(f"Unexpected error in model worker: {e}")
+            # Ensure turn is finished even if catastrophic failure
+            try:
+                coordinator.finish_turn()
+            except:
+                pass
+        finally:
+            generation_queue.task_done()
+
+# Start the model worker thread
+worker_thread = threading.Thread(target=model_worker_loop, daemon=True)
+worker_thread.start()
 
 @mcp.tool()
 def speak(text: str) -> str:
@@ -320,15 +387,10 @@ def speak(text: str) -> str:
     # Get a ticket for playback order
     ticket = coordinator.get_ticket()
 
-    # Start audio generation in a background thread
-    thread = threading.Thread(
-        target=generate_and_play_audio, 
-        args=(text, voice_file_to_use, voice_name, ticket)
-    )
-    thread.daemon = True
-    thread.start()
+    # Put task in queue
+    generation_queue.put((text, voice_file_to_use, voice_name, ticket))
     
-    return "Audio generation started in background. Proceed."
+    return "Audio queued for generation."
 
 def main():
     """Entry point for the console script."""
