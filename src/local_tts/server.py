@@ -14,6 +14,8 @@ import threading
 import queue
 import gc
 
+from local_tts.system_lock import SystemTTSCoordinator
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("local-tts")
@@ -55,6 +57,10 @@ class PlaybackCoordinator:
             self.condition.notify_all()
 
 coordinator = PlaybackCoordinator()
+
+# System-wide cross-process lock — ensures only one TTS inference
+# runs at a time across ALL MCP server instances on the system.
+system_coordinator = SystemTTSCoordinator()
 
 # Global model cache
 MODELS = {
@@ -208,124 +214,133 @@ def play_audio_task(temp_wav_path: str, ticket: int, start_time: float, text_pre
 
 def process_generation_task(text: str, voice_file_to_use: str | None, voice_name: str | None, ticket: int):
     """
-    Executed by the model worker thread. 
-    Loads model (if needed), generates audio, and spawns playback thread.
+    Executed by the model worker thread.
+    Acquires the system-wide inference lock, loads model (if needed),
+    generates audio, then releases the lock and spawns playback thread.
     """
     start_time = time.time()
+    temp_wav_path = None
+    sample_rate = None
+
+    # ── System-wide lock: model load + inference ─────────────────
+    # Only one TTS MCP server across the entire system can be inside
+    # this block at a time.  Other instances queue via FIFO tickets.
     try:
-        model = get_pocket()
+        with system_coordinator.inference_lock():
+            try:
+                model = get_pocket()
+            except Exception as e:
+                logger.error(f"Error loading TTS model: {e}")
+                coordinator.finish_turn()
+                return
+
+            voice_state = None
+            if voice_file_to_use:
+                try:
+                    processed_voice_path = prepare_voice_file(voice_file_to_use)
+                    logger.info(f"Cloning voice from: {voice_name}")
+                    voice_state = model.get_state_for_audio_prompt(processed_voice_path)
+                    if processed_voice_path != voice_file_to_use and os.path.exists(processed_voice_path):
+                        os.remove(processed_voice_path)
+                except Exception as e:
+                    logger.error(f"Error loading custom voice: {str(e)}")
+                    coordinator.finish_turn()
+                    return
+            else:
+                if not voice_name:
+                    voice_name = random.choice(VOICES)
+                try:
+                    if voice_name not in VOICES and "default" not in voice_name:
+                         voice_name = "alba"
+                    clean_name = voice_name.split(" (")[0]
+                    if clean_name in VOICES:
+                         voice_state = model.get_state_for_audio_prompt(clean_name)
+                    else:
+                         voice_state = model.get_state_for_audio_prompt("alba")
+                         voice_name = "alba (fallback)"
+                except Exception as e:
+                     logger.error(f"Error setting voice state: {e}")
+                     voice_state = model.get_state_for_audio_prompt("alba")
+
+            # Process text in chunks
+            chunks = split_text(text)
+            audio_segments = []
+            errors = []
+
+            for i, chunk in enumerate(chunks):
+                if not chunk.strip():
+                    continue
+                try:
+                    segment = model.generate_audio(voice_state, chunk)
+                    if not isinstance(segment, torch.Tensor):
+                         logger.warning(f"Chunk {i} generated non-tensor output: {type(segment)}")
+                         continue
+                    if segment.dim() == 0 or segment.numel() == 0:
+                         logger.warning(f"Chunk {i} generated empty tensor.")
+                         continue
+                    if segment.dim() == 1:
+                        segment = segment.unsqueeze(0)
+                    audio_segments.append(segment)
+                except Exception as e:
+                    msg = f"Error generating audio for chunk '{chunk[:20]}...': {e}"
+                    logger.error(msg)
+                    errors.append(msg)
+                    continue
+
+            if not audio_segments:
+                if errors:
+                    logger.error(f"Error: Failed to generate audio. Details: {'; '.join(errors[:3])}")
+                else:
+                    logger.error("Error: No audio generated (empty text or filtering).")
+                coordinator.finish_turn()
+                return
+
+            # Concatenate all audio segments
+            try:
+                if len(audio_segments) > 1:
+                    audio = torch.cat(audio_segments, dim=1)
+                else:
+                    audio = audio_segments[0]
+                if audio.dim() != 2 or audio.size(0) != 1:
+                     logger.warning(f"Unexpected audio shape: {audio.shape}, attempting to fix.")
+                     if audio.dim() == 1:
+                         audio = audio.unsqueeze(0)
+
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
+                    temp_wav_path = temp_wav.name
+                    wavfile.write(temp_wav_path, model.sample_rate, audio.squeeze().numpy())
+                    sample_rate = model.sample_rate
+
+            except Exception as e:
+                logger.error(f"Error saving audio for playback: {e}")
+                coordinator.finish_turn()
+                if temp_wav_path and os.path.exists(temp_wav_path):
+                    os.remove(temp_wav_path)
+                return
+
+        # ── System lock released — inference complete ────────────
+        # Playback is lightweight; other instances can now run inference
+        # while we play audio.
+
+    except TimeoutError as e:
+        logger.error(f"[SystemLock] {e}")
+        coordinator.finish_turn()
+        return
     except Exception as e:
-        logger.error(f"Error loading TTS model: {e}")
+        logger.error(f"[SystemLock] Unexpected error during locked inference: {e}")
         coordinator.finish_turn()
         return
 
-    voice_state = None
-    if voice_file_to_use:
-        try:
-            # Prepare file (trim if needed)
-            processed_voice_path = prepare_voice_file(voice_file_to_use)
-            
-            logger.info(f"Cloning voice from: {voice_name}")
-            voice_state = model.get_state_for_audio_prompt(processed_voice_path)
-            
-            # Clean up temp file if we created one
-            if processed_voice_path != voice_file_to_use and os.path.exists(processed_voice_path):
-                os.remove(processed_voice_path)
-                
-        except Exception as e:
-            logger.error(f"Error loading custom voice: {str(e)}")
-            coordinator.finish_turn()
-            return
-    else:
-        if not voice_name:
-            voice_name = random.choice(VOICES)
-        try:
-            # If voice_name is not in VOICES (e.g. from failed env var), fallback to alba
-            if voice_name not in VOICES and "default" not in voice_name:
-                 voice_name = "alba"
-            
-            clean_name = voice_name.split(" (")[0]
-            if clean_name in VOICES:
-                 voice_state = model.get_state_for_audio_prompt(clean_name)
-            else:
-                 voice_state = model.get_state_for_audio_prompt("alba")
-                 voice_name = "alba (fallback)"
-        except Exception as e:
-             logger.error(f"Error setting voice state: {e}")
-             voice_state = model.get_state_for_audio_prompt("alba")
-    
-    # Process text in chunks to avoid tensor size mismatch errors with long text
-    chunks = split_text(text)
-    audio_segments = []
-    errors = []
-    
-    for i, chunk in enumerate(chunks):
-        if not chunk.strip():
-            continue
-        try:
-            # Generate audio for each chunk
-            segment = model.generate_audio(voice_state, chunk)
-            
-            # Validation: Ensure segment is a valid tensor
-            if not isinstance(segment, torch.Tensor):
-                 logger.warning(f"Chunk {i} generated non-tensor output: {type(segment)}")
-                 continue
-                 
-            if segment.dim() == 0 or segment.numel() == 0:
-                 logger.warning(f"Chunk {i} generated empty tensor.")
-                 continue
-                 
-            # Ensure 2D [1, T] or 1D [T] -> 2D [1, T]
-            if segment.dim() == 1:
-                segment = segment.unsqueeze(0)
-                
-            audio_segments.append(segment)
-        except Exception as e:
-            msg = f"Error generating audio for chunk '{chunk[:20]}...': {e}"
-            logger.error(msg)
-            errors.append(msg)
-            continue
-            
-    if not audio_segments:
-        if errors:
-            logger.error(f"Error: Failed to generate audio. Details: {'; '.join(errors[:3])}")
-        else:
-            logger.error("Error: No audio generated (empty text or filtering).")
-        coordinator.finish_turn()
-        return
-        
-    # Concatenate all audio segments
-    try:
-        if len(audio_segments) > 1:
-            audio = torch.cat(audio_segments, dim=1)
-        else:
-            audio = audio_segments[0]
-            
-        # Final shape check
-        if audio.dim() != 2 or audio.size(0) != 1:
-             logger.warning(f"Unexpected audio shape: {audio.shape}, attempting to fix.")
-             if audio.dim() == 1:
-                 audio = audio.unsqueeze(0)
-             
-        # Create a temporary file to save the audio
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-            temp_wav_path = temp_wav.name
-            wavfile.write(temp_wav_path, model.sample_rate, audio.squeeze().numpy())
-        
-        # Hand off to playback thread (so model worker is free to process next item)
+    # ── Playback (outside system lock) ───────────────────────────
+    if temp_wav_path:
         playback_thread = threading.Thread(
             target=play_audio_task,
             args=(temp_wav_path, ticket, start_time, text[:50], voice_name)
         )
         playback_thread.daemon = True
         playback_thread.start()
-            
-    except Exception as e:
-        logger.error(f"Error saving audio for playback: {e}")
+    else:
         coordinator.finish_turn()
-        # Cleanup if needed
-        if 'temp_wav_path' in locals() and os.path.exists(temp_wav_path):
-            os.remove(temp_wav_path)
 
 def model_worker_loop():
     """
@@ -391,6 +406,46 @@ def speak(text: str) -> str:
     generation_queue.put((text, voice_file_to_use, voice_name, ticket))
     
     return "Audio queued for generation."
+
+
+@mcp.tool()
+def tts_system_status() -> str:
+    """
+    Show the status of all Local TTS MCP servers running on this system.
+    Reports active instances, queue position, and current lock holder.
+    """
+    lines: list[str] = ["=== Local TTS System Status ==="]
+
+    # Active instances
+    instances = system_coordinator.get_active_instances()
+    lines.append(f"\nRegistered instances: {len(instances)}")
+    for inst in instances:
+        lines.append(
+            f"  • PID {inst.get('pid')} — {inst.get('parent_tool', '?')} "
+            f"(since {inst.get('start_iso', '?')})"
+        )
+
+    # Queue
+    queue_items = system_coordinator.get_queue_status()
+    lines.append(f"\nInference queue: {len(queue_items)} waiting")
+    for i, item in enumerate(queue_items, 1):
+        lines.append(
+            f"  {i}. PID {item.get('pid')} — {item.get('parent_tool', '?')} "
+            f"(queued {item.get('enqueue_iso', '?')})"
+        )
+
+    # Current holder
+    holder = system_coordinator.get_current_holder()
+    if holder:
+        lines.append(
+            f"\nCurrent lock holder: PID {holder.get('pid')} — "
+            f"{holder.get('parent_tool', '?')} "
+            f"(since {holder.get('acquired_iso', '?')})"
+        )
+    else:
+        lines.append("\nNo active inference lock holder.")
+
+    return "\n".join(lines)
 
 def main():
     """Entry point for the console script."""

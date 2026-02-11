@@ -1,4 +1,5 @@
 # AINISH Coder Tooling Distribution - Git Ignore Patterns
+# PlatformIO ignore patterns
 
 # ai pair programmer files
 .cursor/
@@ -13,7 +14,12 @@
 .windsurf/
 .aider*
 .trae/
-docs/
+
+# PlatformIO ignore patterns
+.pio*
+.pio/
+*.pioenvs/
+pio.ini
 
 # Environment and configuration files
 .env
@@ -98,17 +104,33 @@ dist/
 # General
 *.log
 *.tmp
+*.new
+tmp/
 
-# Audio & Models (Local TTS)
-*.wav
-*.mp3
-*.flac
-*.safetensors
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+.pnpm-debug.log
+
+# Security reports
+SECURITY_REPORT.md
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Project-specific patterns (preserved from existing .gitignore)
+# ═══════════════════════════════════════════════════════════════════════════
+
 *.bin
+*.flac
+*.mp3
 *.pt
 *.pth
-src/local_tts/hf_cache/
+*.safetensors
+*.wav
+clone-example.wav
+docs/
 hf_cache/
 lhotse_tools/
 pocket_mcp_project/pocket_server/generated_audio/
-clone-example.wav
+src/local_tts/hf_cache/
+
