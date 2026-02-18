@@ -1,379 +1,24 @@
-from mcp.server.fastmcp import FastMCP
-import os
-import torch
-import scipy.io.wavfile as wavfile
-import time
-import numpy as np
-import random
-import sys
-import tempfile
-import subprocess
-import re
-import logging
-import threading
-import queue
-import gc
+"""
+Local TTS MCP Server.
 
-from local_tts.system_lock import SystemTTSCoordinator
+Lightweight frontend that forwards requests to the background inference service.
+This keeps memory usage low for the MCP process itself.
+"""
+
+import logging
+import os
+import sys
+
+from mcp.server.fastmcp import FastMCP
+
+from local_tts.client import TTSClient
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("local-tts")
-
-# Set environment variables for cache
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Use HF_HUB_CACHE to redirect model downloads while preserving HF_HOME for auth token
-os.environ["HF_HUB_CACHE"] = os.path.join(BASE_DIR, "hf_cache")
-os.environ["LHOTSE_TOOLS_DIR"] = os.path.join(BASE_DIR, "lhotse_tools")
-os.makedirs(os.environ["HF_HUB_CACHE"], exist_ok=True)
-os.makedirs(os.environ["LHOTSE_TOOLS_DIR"], exist_ok=True)
+logger = logging.getLogger("local-tts-server")
 
 # Initialize FastMCP
 mcp = FastMCP("Local TTS")
-
-# Global locks
-PLAYBACK_LOCK = threading.Lock()
-
-class PlaybackCoordinator:
-    def __init__(self):
-        self.current_ticket = 0
-        self.next_ticket = 0
-        self.condition = threading.Condition()
-
-    def get_ticket(self):
-        with self.condition:
-            ticket = self.next_ticket
-            self.next_ticket += 1
-            return ticket
-
-    def wait_for_turn(self, ticket):
-        with self.condition:
-            while ticket != self.current_ticket:
-                self.condition.wait()
-
-    def finish_turn(self):
-        with self.condition:
-            self.current_ticket += 1
-            self.condition.notify_all()
-
-coordinator = PlaybackCoordinator()
-
-# System-wide cross-process lock — ensures only one TTS inference
-# runs at a time across ALL MCP server instances on the system.
-system_coordinator = SystemTTSCoordinator()
-
-# Global model cache
-MODELS = {
-    "pocket": None
-}
-
-# Task Queue for model generation
-generation_queue = queue.Queue()
-
-VOICES = ['alba', 'marius', 'javert', 'jean', 'fantine', 'cosette', 'eponine', 'azelma']
-
-def get_pocket():
-    if MODELS["pocket"] is None:
-        from pocket_tts import TTSModel
-        logger.info("Loading Pocket TTS model into memory...")
-        MODELS["pocket"] = TTSModel.load_model()
-    return MODELS["pocket"]
-
-def unload_pocket():
-    if MODELS["pocket"] is not None:
-        logger.info("Model idle for 10s. Unloading Pocket TTS from memory...")
-        MODELS["pocket"] = None
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-
-def split_text(text: str, max_length: int = 200) -> list[str]:
-    """
-    Split text into chunks ensuring no chunk exceeds max_length.
-    Handles long sentences by splitting on commas or spaces, and forces split if words are too long.
-    """
-    if not text:
-        return []
-
-    # Normalize whitespace: replace newlines/tabs with spaces and collapse multiple spaces
-    text = " ".join(text.split())
-    
-    chunks = []
-    current_chunk = ""
-    
-    # Split by common sentence terminators while keeping them
-    # This regex looks for punctuation followed by space
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    
-    for sentence in sentences:
-        if not sentence.strip():
-            continue
-            
-        # Check if adding this sentence exceeds max_length
-        if len(current_chunk) + len(sentence) + 1 <= max_length:
-            current_chunk += sentence + " "
-        else:
-            # If current chunk has content, push it
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-                current_chunk = ""
-            
-            # If the sentence itself is too long, we need to break it down further
-            if len(sentence) > max_length:
-                words = sentence.split(' ')
-                temp_chunk = ""
-                for word in words:
-                    # Check if word itself is too long
-                    if len(word) > max_length:
-                        # Split very long word into pieces
-                        for i in range(0, len(word), max_length):
-                            sub_word = word[i:i+max_length]
-                            if len(temp_chunk) + len(sub_word) + 1 <= max_length:
-                                temp_chunk += sub_word + " "
-                            else:
-                                if temp_chunk:
-                                    chunks.append(temp_chunk.strip())
-                                temp_chunk = sub_word + " "
-                    else:
-                        if len(temp_chunk) + len(word) + 1 <= max_length:
-                            temp_chunk += word + " "
-                        else:
-                            if temp_chunk:
-                                chunks.append(temp_chunk.strip())
-                            temp_chunk = word + " "
-                current_chunk = temp_chunk # Start next chunk with remainder
-            else:
-                current_chunk = sentence + " "
-            
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-        
-    return chunks
-
-def prepare_voice_file(voice_path: str) -> str:
-    """
-    Prepare voice file for cloning. Trims if too long to prevent context window issues.
-    Returns path to use (either original or temp trimmed).
-    """
-    try:
-        if not os.path.exists(voice_path):
-             logger.error(f"Voice file not found: {voice_path}")
-             return voice_path
-
-        # Check duration
-        sr, data = wavfile.read(voice_path)
-        duration = len(data) / sr
-        
-        # If longer than 10 seconds, trim it
-        if duration > 10.0:
-            logger.info(f"Voice file {os.path.basename(voice_path)} is {duration:.1f}s long. Trimming to 10s.")
-            # Create temp file
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-                temp_wav_path = temp_wav.name
-                
-            # Trim data (handling potential multi-channel)
-            max_samples = int(10.0 * sr)
-            trimmed_data = data[:max_samples]
-            wavfile.write(temp_wav_path, sr, trimmed_data)
-            return temp_wav_path
-            
-    except Exception as e:
-        logger.warning(f"Failed to process voice file {voice_path}: {e}")
-        
-    return voice_path
-
-def play_audio_task(temp_wav_path: str, ticket: int, start_time: float, text_preview: str, voice_name: str):
-    """
-    Handles the sequential playback of the generated audio.
-    """
-    try:
-        # Wait for our turn to play
-        coordinator.wait_for_turn(ticket)
-        
-        # Play the audio using afplay (macOS)
-        if sys.platform == "darwin":
-            subprocess.run(["afplay", "-r", "1.2", temp_wav_path], check=True)
-        else:
-            subprocess.run(["aplay", temp_wav_path], check=False)
-            
-        duration = time.time() - start_time
-        logger.info(f"Spoken: '{text_preview}...' (voice: {voice_name}) in {duration:.2f}s")
-
-    except Exception as e:
-        logger.error(f"Error playing audio: {e}")
-        
-    finally:
-        # Always finish turn so next item can play
-        coordinator.finish_turn()
-        
-        # Clean up the temporary file
-        if os.path.exists(temp_wav_path):
-            os.remove(temp_wav_path)
-
-def process_generation_task(text: str, voice_file_to_use: str | None, voice_name: str | None, ticket: int):
-    """
-    Executed by the model worker thread.
-    Acquires the system-wide inference lock, loads model (if needed),
-    generates audio, then releases the lock and spawns playback thread.
-    """
-    start_time = time.time()
-    temp_wav_path = None
-    sample_rate = None
-
-    # ── System-wide lock: model load + inference ─────────────────
-    # Only one TTS MCP server across the entire system can be inside
-    # this block at a time.  Other instances queue via FIFO tickets.
-    try:
-        with system_coordinator.inference_lock():
-            try:
-                model = get_pocket()
-            except Exception as e:
-                logger.error(f"Error loading TTS model: {e}")
-                coordinator.finish_turn()
-                return
-
-            voice_state = None
-            if voice_file_to_use:
-                try:
-                    processed_voice_path = prepare_voice_file(voice_file_to_use)
-                    logger.info(f"Cloning voice from: {voice_name}")
-                    voice_state = model.get_state_for_audio_prompt(processed_voice_path)
-                    if processed_voice_path != voice_file_to_use and os.path.exists(processed_voice_path):
-                        os.remove(processed_voice_path)
-                except Exception as e:
-                    logger.error(f"Error loading custom voice: {str(e)}")
-                    coordinator.finish_turn()
-                    return
-            else:
-                if not voice_name:
-                    voice_name = random.choice(VOICES)
-                try:
-                    if voice_name not in VOICES and "default" not in voice_name:
-                         voice_name = "alba"
-                    clean_name = voice_name.split(" (")[0]
-                    if clean_name in VOICES:
-                         voice_state = model.get_state_for_audio_prompt(clean_name)
-                    else:
-                         voice_state = model.get_state_for_audio_prompt("alba")
-                         voice_name = "alba (fallback)"
-                except Exception as e:
-                     logger.error(f"Error setting voice state: {e}")
-                     voice_state = model.get_state_for_audio_prompt("alba")
-
-            # Process text in chunks
-            chunks = split_text(text)
-            audio_segments = []
-            errors = []
-
-            for i, chunk in enumerate(chunks):
-                if not chunk.strip():
-                    continue
-                try:
-                    segment = model.generate_audio(voice_state, chunk)
-                    if not isinstance(segment, torch.Tensor):
-                         logger.warning(f"Chunk {i} generated non-tensor output: {type(segment)}")
-                         continue
-                    if segment.dim() == 0 or segment.numel() == 0:
-                         logger.warning(f"Chunk {i} generated empty tensor.")
-                         continue
-                    if segment.dim() == 1:
-                        segment = segment.unsqueeze(0)
-                    audio_segments.append(segment)
-                except Exception as e:
-                    msg = f"Error generating audio for chunk '{chunk[:20]}...': {e}"
-                    logger.error(msg)
-                    errors.append(msg)
-                    continue
-
-            if not audio_segments:
-                if errors:
-                    logger.error(f"Error: Failed to generate audio. Details: {'; '.join(errors[:3])}")
-                else:
-                    logger.error("Error: No audio generated (empty text or filtering).")
-                coordinator.finish_turn()
-                return
-
-            # Concatenate all audio segments
-            try:
-                if len(audio_segments) > 1:
-                    audio = torch.cat(audio_segments, dim=1)
-                else:
-                    audio = audio_segments[0]
-                if audio.dim() != 2 or audio.size(0) != 1:
-                     logger.warning(f"Unexpected audio shape: {audio.shape}, attempting to fix.")
-                     if audio.dim() == 1:
-                         audio = audio.unsqueeze(0)
-
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav:
-                    temp_wav_path = temp_wav.name
-                    wavfile.write(temp_wav_path, model.sample_rate, audio.squeeze().numpy())
-                    sample_rate = model.sample_rate
-
-            except Exception as e:
-                logger.error(f"Error saving audio for playback: {e}")
-                coordinator.finish_turn()
-                if temp_wav_path and os.path.exists(temp_wav_path):
-                    os.remove(temp_wav_path)
-                return
-
-        # ── System lock released — inference complete ────────────
-        # Playback is lightweight; other instances can now run inference
-        # while we play audio.
-
-    except TimeoutError as e:
-        logger.error(f"[SystemLock] {e}")
-        coordinator.finish_turn()
-        return
-    except Exception as e:
-        logger.error(f"[SystemLock] Unexpected error during locked inference: {e}")
-        coordinator.finish_turn()
-        return
-
-    # ── Playback (outside system lock) ───────────────────────────
-    if temp_wav_path:
-        playback_thread = threading.Thread(
-            target=play_audio_task,
-            args=(temp_wav_path, ticket, start_time, text[:50], voice_name)
-        )
-        playback_thread.daemon = True
-        playback_thread.start()
-    else:
-        coordinator.finish_turn()
-
-def model_worker_loop():
-    """
-    Background loop that processes generation requests.
-    Unloads model if no requests come in for 10 seconds.
-    """
-    logger.info("Model worker loop started.")
-    while True:
-        try:
-            # Wait for 10 seconds for a new task
-            task = generation_queue.get(timeout=10.0)
-        except queue.Empty:
-            # Timeout reached, unload model if it is loaded
-            unload_pocket()
-            continue
-
-        # We have a task
-        try:
-            text, voice_file, voice_name, ticket = task
-            process_generation_task(text, voice_file, voice_name, ticket)
-        except Exception as e:
-            logger.error(f"Unexpected error in model worker: {e}")
-            # Ensure turn is finished even if catastrophic failure
-            try:
-                coordinator.finish_turn()
-            except:
-                pass
-        finally:
-            generation_queue.task_done()
-
-# Start the model worker thread
-worker_thread = threading.Thread(target=model_worker_loop, daemon=True)
-worker_thread.start()
 
 @mcp.tool()
 def speak(text: str) -> str:
@@ -386,70 +31,57 @@ def speak(text: str) -> str:
     if not text or not text.strip():
         return "Error: Text input is empty."
 
-    voice_file_to_use = None
+    voice_path = None
     voice_name = None
     
     # Determine which voice path to use
     if os.environ.get("LOCAL_TTS_VOICE_PATH"):
         env_path = os.environ.get("LOCAL_TTS_VOICE_PATH")
         if os.path.exists(env_path):
-            voice_file_to_use = env_path
+            voice_path = env_path
             voice_name = os.path.basename(env_path) + " (default)"
         else:
-            # Fallback if env var points to invalid file
             voice_name = "random" 
 
-    # Get a ticket for playback order
-    ticket = coordinator.get_ticket()
+    try:
+        client = TTSClient()
+        # This will auto-start the service if needed
+        resp = client.speak(text, voice_path, voice_name)
+        
+        if resp.get("status") == "queued":
+            return "Audio queued for generation."
+        else:
+            return f"Error queuing audio: {resp}"
+            
+    except Exception as e:
+        logger.error(f"Failed to communicate with TTS Service: {e}")
+        return f"Error: Failed to communicate with background service. {e}"
 
-    # Put task in queue
-    generation_queue.put((text, voice_file_to_use, voice_name, ticket))
-    
-    return "Audio queued for generation."
-
-
-@mcp.tool()
 def tts_system_status() -> str:
     """
-    Show the status of all Local TTS MCP servers running on this system.
-    Reports active instances, queue position, and current lock holder.
+    (Internal) Show the status of the Local TTS Service.
     """
-    lines: list[str] = ["=== Local TTS System Status ==="]
-
-    # Active instances
-    instances = system_coordinator.get_active_instances()
-    lines.append(f"\nRegistered instances: {len(instances)}")
-    for inst in instances:
-        lines.append(
-            f"  • PID {inst.get('pid')} — {inst.get('parent_tool', '?')} "
-            f"(since {inst.get('start_iso', '?')})"
-        )
-
-    # Queue
-    queue_items = system_coordinator.get_queue_status()
-    lines.append(f"\nInference queue: {len(queue_items)} waiting")
-    for i, item in enumerate(queue_items, 1):
-        lines.append(
-            f"  {i}. PID {item.get('pid')} — {item.get('parent_tool', '?')} "
-            f"(queued {item.get('enqueue_iso', '?')})"
-        )
-
-    # Current holder
-    holder = system_coordinator.get_current_holder()
-    if holder:
-        lines.append(
-            f"\nCurrent lock holder: PID {holder.get('pid')} — "
-            f"{holder.get('parent_tool', '?')} "
-            f"(since {holder.get('acquired_iso', '?')})"
-        )
-    else:
-        lines.append("\nNo active inference lock holder.")
-
+    lines = ["=== Local TTS System Status ==="]
+    
+    try:
+        client = TTSClient()
+        if not client.is_service_running():
+             lines.append("Status: Stopped (will auto-start on next request)")
+        else:
+             status = client.get_status()
+             lines.append(f"Status: {status.get('status', 'unknown')}")
+             lines.append(f"Model Loaded: {status.get('model_loaded', False)}")
+             lines.append(f"Service RAM: {status.get('rss_mb', 0):.1f}MB")
+             lines.append(f"System RAM: {status.get('ram_percent', 0):.1f}%")
+             
+    except Exception as e:
+        lines.append(f"Error checking status: {e}")
+        
     return "\n".join(lines)
 
 def main():
     """Entry point for the console script."""
-    print("Starting Local TTS MCP Server...", file=sys.stderr)
+    print("Starting Local TTS MCP Server (Client Mode)...", file=sys.stderr)
     mcp.run()
 
 if __name__ == "__main__":

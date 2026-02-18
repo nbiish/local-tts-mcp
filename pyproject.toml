@@ -18,6 +18,7 @@ dependencies = [
     "numpy",
     "torch>=2.4.0",
     "huggingface-hub>=0.23.0",
+    "psutil",
 ]
 
 [[tool.uv.index]]
@@ -31,3 +32,8 @@ required-environments = ["sys_platform == 'darwin' and platform_machine == 'arm6
 
 [project.scripts]
 local-tts = "local_tts.server:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

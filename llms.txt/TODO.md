@@ -17,3 +17,5 @@
 - [x] Implement Voice Cloning support (`voice_path` argument)
 - [x] Implement Default Voice Cloning via `LOCAL_TTS_VOICE_PATH`
 - [x] Add Authentication support for gated models (Hugging Face)
+- [x] Implement background system status monitoring and memory management
+- [x] Refactor to Client-Server architecture (Single Model Instance)

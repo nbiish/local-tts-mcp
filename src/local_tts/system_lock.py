@@ -26,6 +26,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
+from local_tts.resource_manager import ResourceManager
+
 logger = logging.getLogger("local-tts")
 
 # ── Shared filesystem paths ──────────────────────────────────────────
@@ -156,8 +158,42 @@ class SystemTTSCoordinator:
             "parent_tool": self.parent_tool,
             "start_time": time.time(),
             "start_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "rss_mb": 0.0,  # Initial value
         }
         reg_file.write_text(json.dumps(info, indent=2))
+
+    def start_registry_updater(self, interval: float = 5.0) -> None:
+        """Start background thread to update registry with current memory usage."""
+        import threading
+        def _update_loop():
+            rm = ResourceManager()
+            while True:
+                try:
+                    time.sleep(interval)
+                    proc_info = rm.get_process_memory_info()
+                    self._update_registry_memory(proc_info["rss_mb"])
+                except Exception:
+                    pass
+        
+        t = threading.Thread(target=_update_loop, daemon=True)
+        t.start()
+
+    def _update_registry_memory(self, rss_mb: float) -> None:
+        """Update our registry file with current memory usage."""
+        reg_file = SYSTEM_TTS_REGISTRY / f"{self.instance_id}.json"
+        if not reg_file.exists():
+            return
+        try:
+            content = reg_file.read_text()
+            if not content:
+                return
+            info = json.loads(content)
+            info["rss_mb"] = rss_mb
+            info["last_updated"] = time.time()
+            reg_file.write_text(json.dumps(info, indent=2))
+        except Exception:
+            pass
+
 
     def _deregister(self) -> None:
         """Remove our registry entry."""
@@ -188,15 +224,16 @@ class SystemTTSCoordinator:
 
     # ── Queue / ticket management ────────────────────────────────────
 
-    def _create_ticket(self) -> Path:
+    def _create_ticket(self, priority: int = 1) -> Path:
         """Create a numbered ticket file in the shared queue."""
-        # Nanosecond timestamp ensures ordering + PID for uniqueness
-        ticket_name = f"{time.time_ns():020d}-{self.pid}.ticket"
+        # Priority prefix (0=High, 1=Normal, 2=Low) + Nanosecond timestamp ensures ordering
+        ticket_name = f"{priority:02d}-{time.time_ns():020d}-{self.pid}.ticket"
         ticket_path = SYSTEM_TTS_QUEUE / ticket_name
         info = {
             "pid": self.pid,
             "instance_id": self.instance_id,
             "parent_tool": self.parent_tool,
+            "priority": priority,
             "enqueue_time": time.time(),
             "enqueue_iso": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         }
@@ -294,20 +331,22 @@ class SystemTTSCoordinator:
             self._lock_fd = None
 
     @contextmanager
-    def inference_lock(self, timeout: float = LOCK_TIMEOUT_S):
+    def inference_lock(self, timeout: float = LOCK_TIMEOUT_S, priority: int = 1, estimated_mb: float = 0):
         """
         Context manager that ensures exclusive system-wide TTS inference.
 
         Workflow:
         1. Create a ticket in the shared FIFO queue
         2. Wait until our ticket is first (poll + stale cleanup)
-        3. Acquire ``fcntl.flock`` for hard mutual exclusion
-        4. Yield to caller (model load + inference happens here)
-        5. Release lock + remove ticket on exit
+        3. Check system resources (RAM)
+        4. Acquire ``fcntl.flock`` for hard mutual exclusion
+        5. Yield to caller (model load + inference happens here)
+        6. Release lock + remove ticket on exit
 
         Raises ``TimeoutError`` if we cannot acquire within *timeout* seconds.
         """
-        ticket_path = self._create_ticket()
+        rm = ResourceManager()
+        ticket_path = self._create_ticket(priority=priority)
         ticket_name = ticket_path.name
         start = time.time()
         acquired = False
@@ -320,7 +359,24 @@ class SystemTTSCoordinator:
                 tickets = self._sorted_tickets()
 
                 if not tickets or tickets[0] == ticket_name:
-                    break  # we are first
+                    # We are first in line, check system health
+                    status = rm.get_status()
+                    if status.is_critical:
+                        logger.warning(f"[SystemLock] High memory usage ({status.memory_percent:.1f}%). Pausing...")
+                        time.sleep(2.0)
+                        # Check timeout even while pausing for memory
+                        if (time.time() - start) > timeout:
+                            raise TimeoutError("Timed out waiting for memory to free up")
+                        continue
+
+                    if estimated_mb > 0 and not rm.check_allocation_feasibility(estimated_mb):
+                         logger.warning(f"[SystemLock] Insufficient memory for task ({estimated_mb}MB needed). Retrying...")
+                         time.sleep(2.0)
+                         if (time.time() - start) > timeout:
+                             raise TimeoutError("Timed out waiting for sufficient memory allocation")
+                         continue
+
+                    break  # we are first and safe
 
                 elapsed = time.time() - start
                 if elapsed > timeout:

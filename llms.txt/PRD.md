@@ -17,13 +17,16 @@
 5.  **Non-Blocking & Queued**: The tool returns immediately to the LLM. Audio is generated in the background and queued to ensure correct playback order.
 6.  **Auto-Play & Cleanup**: Audio is played immediately on the host machine via `afplay` (macOS) and temporary files are deleted instantly. No file management is required from the LLM.
 7.  **Minimal Interface**: Exposes a single `speak` tool with simplified arguments.
+8.  **Client-Server Architecture**: A single background inference service handles all TTS requests, ensuring only one model is loaded in memory across multiple MCP clients.
 
 ## Architecture
 
 - **Language:** Python 3.10+
 - **Framework:** `mcp` (FastMCP), `pocket-tts`
 - **Dependency Management:** `uv`
-- **Transport:** stdio (Standard Input/Output)
+- **Transport:** 
+  - MCP: stdio (Standard Input/Output)
+  - Internal: Unix Domain Socket (UDS)
 - **Authentication:** Hugging Face (for Voice Cloning model)
 
 ## Tools
