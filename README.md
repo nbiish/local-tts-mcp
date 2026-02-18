@@ -32,6 +32,16 @@ Add high-quality, local text-to-speech capabilities to your AI assistant. Powere
 - 🎲 **Simple Usage**: Automatically selects a random voice for variety.
 - 🦜 **Voice Cloning**: Clone any voice using a reference WAV file.
 - 🔒 **Private**: All audio generation happens locally.
+- 🧩 **Client-Server Architecture**: Efficient memory usage. A single background service handles inference for all connected MCP clients (Claude, VS Code, Cursor, etc.).
+
+## Architecture
+
+This project uses a **Client-Server** architecture to optimize resource usage.
+
+- **MCP Client (`server.py`)**: Lightweight process that exposes the `speak` tool to the LLM. It forwards requests to the background service.
+- **Inference Service (`service.py`)**: Background daemon that loads the **Pocket TTS** model into memory. It handles the request queue, generates audio, and manages system resources.
+
+This means you can have multiple AI assistants using this tool simultaneously without each one loading a separate copy of the heavy TTS model.
 
 ## Installation
 

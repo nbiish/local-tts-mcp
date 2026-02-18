@@ -18,6 +18,7 @@
 6.  **Auto-Play & Cleanup**: Audio is played immediately on the host machine via `afplay` (macOS) and temporary files are deleted instantly. No file management is required from the LLM.
 7.  **Minimal Interface**: Exposes a single `speak` tool with simplified arguments.
 8.  **Client-Server Architecture**: A single background inference service handles all TTS requests, ensuring only one model is loaded in memory across multiple MCP clients.
+9.  **Resource Management**: Background monitoring system tracks RAM usage, throttles requests if memory is low, and auto-unloads models during inactivity.
 
 ## Architecture
 
@@ -26,8 +27,9 @@
 - **Dependency Management:** `uv`
 - **Transport:** 
   - MCP: stdio (Standard Input/Output)
-  - Internal: Unix Domain Socket (UDS)
+  - Internal: Unix Domain Socket (UDS) at `/tmp/local-tts-mcp/inference.sock`
 - **Authentication:** Hugging Face (for Voice Cloning model)
+- **Monitoring:** `psutil` based resource manager
 
 ## Tools
 
